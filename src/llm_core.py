@@ -751,6 +751,26 @@ def _anthropic_supports_effort(model: str) -> bool:
         return (int(sm.group(1)), int(sm.group(2))) >= (4, 6)
     return False
 
+
+def _anthropic_supports_1m_context(model: str) -> bool:
+    """Models with a 1M context window (Opus 4.6+, Sonnet 4.6+, Fable/Mythos).
+
+    Gates the `context-1m-2025-08-07` beta header so requests can use the full
+    1M window (the Claude Code CLI sends this same beta).
+    """
+    if not isinstance(model, str) or not model:
+        return False
+    m = model.lower()
+    if "fable" in m or "mythos" in m:
+        return True
+    om = re.search(r"(?<![a-z])opus[-_]?(\d+)[-_.](\d{1,2})(?!\d)", m)
+    if om:
+        return (int(om.group(1)), int(om.group(2))) >= (4, 6)
+    sm = re.search(r"(?<![a-z])sonnet[-_]?(\d+)[-_.](\d{1,2})(?!\d)", m)
+    if sm:
+        return (int(sm.group(1)), int(sm.group(2))) >= (4, 6)
+    return False
+
 # Models that support structured thinking — may output </think> without opening tag
 _THINKING_MODEL_PATTERNS = ("qwen3", "qwq", "deepseek-r1", "deepseek-reasoner", "minimax", "m2-reap", "gemma")
 
@@ -879,11 +899,18 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
     }
     # Effort (Opus 4.5+/Sonnet 4.6+/Fable) drives reasoning depth via adaptive
     # thinking; sampling params are incompatible with that path, so omit them.
+    # Subscriptions default to claude.ai-style reasoning (adaptive thinking at
+    # high effort) so Opus/Sonnet aren't "dumb" out of the box; the effort
+    # selector can dial it down/up. API-key requests are unchanged unless an
+    # effort is explicitly chosen.
+    eff = effort
+    if not eff and oauth and _anthropic_supports_effort(model):
+        eff = "high"
     effort_active = (
-        bool(effort) and str(effort).lower() in _EFFORT_VALUES and _anthropic_supports_effort(model)
+        bool(eff) and str(eff).lower() in _EFFORT_VALUES and _anthropic_supports_effort(model)
     )
     if effort_active:
-        payload["output_config"] = {"effort": str(effort).lower()}
+        payload["output_config"] = {"effort": str(eff).lower()}
         payload["thinking"] = {"type": "adaptive"}
     # Opus 4.7+ removed the sampling parameters — sending `temperature` (even 0.0)
     # returns HTTP 400. Omit it for those models; older Claude models still take it.
@@ -929,17 +956,26 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
             payload["tools"] = anthropic_tools
     return payload
 
-def _build_anthropic_headers(headers, oauth=False):
+def _build_anthropic_headers(headers, oauth=False, model=None):
     """Build Anthropic request headers.
 
     API-key mode (default): convert ``Authorization: Bearer`` to ``x-api-key``.
     OAuth/subscription mode (``oauth=True``): keep the Bearer token as-is and
     send ``anthropic-beta: oauth-2025-04-20`` instead of ``x-api-key`` — that
     beta header is what authorizes a subscription access token on /v1/messages.
+
+    For 1M-context models (Opus 4.6+/Sonnet 4.6+/Fable) the
+    ``context-1m-2025-08-07`` beta is added so the full window is usable (the
+    Claude Code CLI sends this same beta).
     """
     h = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
+    betas = []
     if oauth:
-        h["anthropic-beta"] = "oauth-2025-04-20"
+        betas.append("oauth-2025-04-20")
+    if model and _anthropic_supports_1m_context(model):
+        betas.append("context-1m-2025-08-07")
+    if betas:
+        h["anthropic-beta"] = ",".join(betas)
     if headers:
         for k, v in headers.items():
             kl = k.lower()
@@ -948,8 +984,10 @@ def _build_anthropic_headers(headers, oauth=False):
                     h["Authorization"] = v
                 else:
                     h["x-api-key"] = v[7:]
-            elif kl == "anthropic-beta" and oauth:
-                continue  # already set above; don't clobber the oauth beta
+            elif kl == "anthropic-beta":
+                # Skip incoming beta when we built our own; otherwise keep it.
+                if not betas:
+                    h[k] = v
             else:
                 h[k] = v
     return h
@@ -1319,7 +1357,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
 
     if _is_anthropic_like(provider):
         target_url = _normalize_anthropic_url(url)
-        h = _build_anthropic_headers(headers, oauth=(provider == "claude-subscription"))
+        h = _build_anthropic_headers(headers, oauth=(provider == "claude-subscription"), model=model)
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens, oauth=(provider == "claude-subscription"), effort=effort)
     elif provider == "ollama":
         target_url = _normalize_ollama_url(url)
@@ -1510,7 +1548,7 @@ async def llm_call_async(
 
     if _is_anthropic_like(provider):
         target_url = _normalize_anthropic_url(url)
-        h = _build_anthropic_headers(headers, oauth=(provider == "claude-subscription"))
+        h = _build_anthropic_headers(headers, oauth=(provider == "claude-subscription"), model=model)
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens, oauth=(provider == "claude-subscription"), effort=effort)
     elif provider == "ollama":
         target_url = _normalize_ollama_url(url)
@@ -1627,7 +1665,7 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
 
     if _is_anthropic_like(provider):
         target_url = _normalize_anthropic_url(url)
-        h = _build_anthropic_headers(headers, oauth=(provider == "claude-subscription"))
+        h = _build_anthropic_headers(headers, oauth=(provider == "claude-subscription"), model=model)
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens, stream=True, tools=tools, oauth=(provider == "claude-subscription"), effort=effort)
     elif provider == "ollama":
         target_url = _normalize_ollama_url(url)

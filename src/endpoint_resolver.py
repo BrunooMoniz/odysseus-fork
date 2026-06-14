@@ -81,36 +81,22 @@ def resolve_endpoint_runtime(ep, owner: Optional[str] = None) -> Tuple[str, Opti
     api_key = getattr(ep, "api_key", None)
     auth_id = getattr(ep, "provider_auth_id", None)
     if auth_id:
-        resolve_runtime_credentials = _runtime_resolver_for(auth_id)
+        resolve_runtime_credentials = _runtime_resolver_for(base)
         creds = resolve_runtime_credentials(auth_id, owner=owner)
         base = normalize_base(creds.get("base_url") or base)
         api_key = creds.get("api_key")
     return base, api_key
 
 
-def _runtime_resolver_for(auth_id: str):
-    """Pick the credential resolver matching a ProviderAuthSession's provider.
+def _runtime_resolver_for(base_url: str):
+    """Pick the credential resolver for a subscription endpoint by its base URL.
 
-    Subscription-backed endpoints store refresh tokens in ProviderAuthSession;
-    each provider module exposes its own ``resolve_runtime_credentials``.
+    Keyed on the endpoint's own base URL (always present) rather than a
+    ProviderAuthSession lookup, so a transiently-missing auth row still routes
+    to the correct provider's resolver — which then raises its own
+    correctly-named error instead of a misleading one.
     """
-    provider = None
-    try:
-        from core.database import ProviderAuthSession
-
-        db = SessionLocal()
-        try:
-            row = (
-                db.query(ProviderAuthSession.provider)
-                .filter(ProviderAuthSession.id == auth_id)
-                .first()
-            )
-            provider = row[0] if row else None
-        finally:
-            db.close()
-    except Exception:
-        provider = None
-    if provider == "claude-subscription":
+    if _detect_provider(base_url or "") == "claude-subscription":
         from src.claude_subscription import resolve_runtime_credentials
 
         return resolve_runtime_credentials

@@ -173,6 +173,65 @@ class TestEffort:
         )
         assert "output_config" not in p
 
+    def test_oauth_defaults_to_high_effort(self):
+        # Subscription (oauth) defaults to adaptive thinking + high effort.
+        p = llm_core._build_anthropic_payload(
+            "claude-opus-4-8", [{"role": "user", "content": "hi"}], 0.7, 64, oauth=True
+        )
+        assert p["output_config"] == {"effort": "high"}
+        assert p["thinking"] == {"type": "adaptive"}
+        assert "temperature" not in p
+
+    def test_oauth_default_effort_skipped_for_haiku(self):
+        p = llm_core._build_anthropic_payload(
+            "claude-haiku-4-5-20251001", [{"role": "user", "content": "hi"}], 0.7, 64, oauth=True
+        )
+        assert "output_config" not in p
+        assert p.get("temperature") == 0.7
+
+    def test_explicit_effort_overrides_oauth_default(self):
+        p = llm_core._build_anthropic_payload(
+            "claude-opus-4-8", [{"role": "user", "content": "hi"}], 0.7, 64, oauth=True, effort="low"
+        )
+        assert p["output_config"] == {"effort": "low"}
+
+
+# ── 1M context window ──
+
+class TestContext1M:
+    def test_supports_1m_matrix(self):
+        s = llm_core._anthropic_supports_1m_context
+        assert s("claude-opus-4-8")
+        assert s("claude-opus-4-6")
+        assert s("claude-sonnet-4-6")
+        assert s("claude-fable-5")
+        assert not s("claude-opus-4-5-20251101")     # 4.5 < 4.6
+        assert not s("claude-sonnet-4-5-20250929")
+        assert not s("claude-haiku-4-5-20251001")
+        assert not s("gpt-4o")
+
+    def test_headers_add_context_1m_for_oauth(self):
+        h = llm_core._build_anthropic_headers(
+            {"Authorization": "Bearer T"}, oauth=True, model="claude-opus-4-8"
+        )
+        betas = h["anthropic-beta"].split(",")
+        assert "oauth-2025-04-20" in betas
+        assert "context-1m-2025-08-07" in betas
+        assert h["Authorization"] == "Bearer T"
+
+    def test_headers_context_1m_for_apikey(self):
+        h = llm_core._build_anthropic_headers(
+            {"Authorization": "Bearer K"}, oauth=False, model="claude-opus-4-8"
+        )
+        assert h["anthropic-beta"] == "context-1m-2025-08-07"
+        assert h["x-api-key"] == "K"
+
+    def test_headers_no_context_1m_for_haiku(self):
+        h = llm_core._build_anthropic_headers(
+            {"Authorization": "Bearer T"}, oauth=True, model="claude-haiku-4-5"
+        )
+        assert h["anthropic-beta"] == "oauth-2025-04-20"
+
 
 # ── Pasted-credential parsing ──
 
