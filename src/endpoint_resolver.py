@@ -81,12 +81,42 @@ def resolve_endpoint_runtime(ep, owner: Optional[str] = None) -> Tuple[str, Opti
     api_key = getattr(ep, "api_key", None)
     auth_id = getattr(ep, "provider_auth_id", None)
     if auth_id:
-        from src.chatgpt_subscription import resolve_runtime_credentials
-
+        resolve_runtime_credentials = _runtime_resolver_for(auth_id)
         creds = resolve_runtime_credentials(auth_id, owner=owner)
         base = normalize_base(creds.get("base_url") or base)
         api_key = creds.get("api_key")
     return base, api_key
+
+
+def _runtime_resolver_for(auth_id: str):
+    """Pick the credential resolver matching a ProviderAuthSession's provider.
+
+    Subscription-backed endpoints store refresh tokens in ProviderAuthSession;
+    each provider module exposes its own ``resolve_runtime_credentials``.
+    """
+    provider = None
+    try:
+        from core.database import ProviderAuthSession
+
+        db = SessionLocal()
+        try:
+            row = (
+                db.query(ProviderAuthSession.provider)
+                .filter(ProviderAuthSession.id == auth_id)
+                .first()
+            )
+            provider = row[0] if row else None
+        finally:
+            db.close()
+    except Exception:
+        provider = None
+    if provider == "claude-subscription":
+        from src.claude_subscription import resolve_runtime_credentials
+
+        return resolve_runtime_credentials
+    from src.chatgpt_subscription import resolve_runtime_credentials
+
+    return resolve_runtime_credentials
 
 
 # Cache for Tailscale hostname → IP resolution
@@ -173,6 +203,11 @@ def build_chat_url(base: str) -> str:
     """Return the correct chat endpoint URL for a given base."""
     base = resolve_url(base)
     provider = _detect_provider(base)
+    if provider == "claude-subscription":
+        # Keep the /oauth sentinel so downstream _detect_provider still routes
+        # this as claude-subscription; _normalize_anthropic_url builds the real
+        # /v1/messages URL (stripping /oauth) at request time.
+        return base
     if provider == "anthropic":
         return _anthropic_api_root(base) + "/v1/messages"
     if provider == "ollama":
@@ -186,6 +221,9 @@ def build_models_url(base: str) -> Optional[str]:
     """Return the provider-specific model-list endpoint URL for a base."""
     base = normalize_base(resolve_url(base))
     provider = _detect_provider(base)
+    if provider == "claude-subscription":
+        root = base[: -len("/oauth")].rstrip("/") if base.endswith("/oauth") else base
+        return _anthropic_api_root(root) + "/v1/models"
     if provider == "anthropic":
         return _anthropic_api_root(base) + "/v1/models"
     if provider == "ollama":
@@ -199,6 +237,9 @@ def build_headers(api_key: Optional[str], base: str) -> Dict[str, str]:
     """Build auth headers for an endpoint."""
     provider = _detect_provider(base)
     headers: Dict[str, str] = {}
+    if provider == "claude-subscription":
+        from src.claude_subscription import claude_oauth_headers
+        return claude_oauth_headers(api_key)
     if provider == "anthropic":
         if api_key:
             headers["x-api-key"] = api_key

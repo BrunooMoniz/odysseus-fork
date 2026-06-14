@@ -434,6 +434,12 @@ def _detect_provider(url: str) -> str:
     """
     if _is_ollama_native_url(url):
         return "ollama"
+    # Checked before the plain anthropic.com host match: the OAuth-backed
+    # subscription endpoint lives on the same host, distinguished by an /oauth
+    # marker in its stored base URL.
+    from src.claude_subscription import is_claude_subscription_base
+    if is_claude_subscription_base(url):
+        return "claude-subscription"
     if _host_match(url, "anthropic.com"):
         return "anthropic"
     if _host_match(url, "opencode.ai/zen/go"):
@@ -453,6 +459,16 @@ def _detect_provider(url: str) -> str:
     if is_copilot_base(url):
         return "copilot"
     return "openai"
+
+
+def _is_anthropic_like(provider: str) -> bool:
+    """Providers that speak the Anthropic /v1/messages API.
+
+    ``anthropic`` (API key, x-api-key) and ``claude-subscription`` (OAuth
+    bearer) share request/response/stream handling; only the auth header
+    differs (see ``_build_anthropic_headers``).
+    """
+    return provider in ("anthropic", "claude-subscription")
 
 
 def _is_self_hosted_openai_compatible(url: str) -> bool:
@@ -524,6 +540,8 @@ def _provider_label(url: str) -> str:
     """Human-friendly provider name for error messages."""
     if not url:
         return "provider"
+    from src.claude_subscription import is_claude_subscription_base
+    if is_claude_subscription_base(url): return "Claude Subscription"
     if _host_match(url, "anthropic.com"): return "Anthropic"
     if _host_match(url, "ollama.com"): return "Ollama Cloud"
     if _host_match(url, "x.ai"): return "xAI"
@@ -852,13 +870,27 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
             payload["tools"] = anthropic_tools
     return payload
 
-def _build_anthropic_headers(headers):
-    """Convert Bearer auth to x-api-key for Anthropic."""
+def _build_anthropic_headers(headers, oauth=False):
+    """Build Anthropic request headers.
+
+    API-key mode (default): convert ``Authorization: Bearer`` to ``x-api-key``.
+    OAuth/subscription mode (``oauth=True``): keep the Bearer token as-is and
+    send ``anthropic-beta: oauth-2025-04-20`` instead of ``x-api-key`` — that
+    beta header is what authorizes a subscription access token on /v1/messages.
+    """
     h = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
+    if oauth:
+        h["anthropic-beta"] = "oauth-2025-04-20"
     if headers:
         for k, v in headers.items():
-            if k.lower() == "authorization" and isinstance(v, str) and v.startswith("Bearer "):
-                h["x-api-key"] = v[7:]
+            kl = k.lower()
+            if kl == "authorization" and isinstance(v, str) and v.startswith("Bearer "):
+                if oauth:
+                    h["Authorization"] = v
+                else:
+                    h["x-api-key"] = v[7:]
+            elif kl == "anthropic-beta" and oauth:
+                continue  # already set above; don't clobber the oauth beta
             else:
                 h[k] = v
     return h
@@ -1031,8 +1063,14 @@ def _sanitize_llm_messages(messages: List[Dict]) -> List[Dict]:
     return merged
 
 def _normalize_anthropic_url(url: str) -> str:
-    """Ensure Anthropic URL points to /v1/messages."""
+    """Ensure Anthropic URL points to /v1/messages.
+
+    Also strips the claude-subscription ``/oauth`` sentinel marker so the
+    request targets the real api.anthropic.com/v1/messages endpoint.
+    """
     url = url.rstrip("/")
+    if url.endswith("/oauth"):
+        url = url[: -len("/oauth")].rstrip("/")
     if url.endswith("/v1/messages"):
         return url
     if url.endswith("/v1"):
@@ -1219,9 +1257,9 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         logger.debug(f"Returning cached response for key: {cache_key}")
         return cached_response
 
-    if provider == "anthropic":
+    if _is_anthropic_like(provider):
         target_url = _normalize_anthropic_url(url)
-        h = _build_anthropic_headers(headers)
+        h = _build_anthropic_headers(headers, oauth=(provider == "claude-subscription"))
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens)
     elif provider == "ollama":
         target_url = _normalize_ollama_url(url)
@@ -1253,7 +1291,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         raise HTTPException(502, f"Upstream {target_url} -> {r.status_code}: {r.text}")
     data = r.json()
     try:
-        if provider == "anthropic":
+        if _is_anthropic_like(provider):
             response = _parse_anthropic_response(data)
         elif provider == "ollama":
             response = _parse_ollama_response(data)
@@ -1409,9 +1447,9 @@ async def llm_call_async(
         _set_cached_response(cache_key, response)
         return response
 
-    if provider == "anthropic":
+    if _is_anthropic_like(provider):
         target_url = _normalize_anthropic_url(url)
-        h = _build_anthropic_headers(headers)
+        h = _build_anthropic_headers(headers, oauth=(provider == "claude-subscription"))
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens)
     elif provider == "ollama":
         target_url = _normalize_ollama_url(url)
@@ -1470,7 +1508,7 @@ async def llm_call_async(
             _clear_host_dead(target_url)
             data = r.json()
             try:
-                if provider == "anthropic":
+                if _is_anthropic_like(provider):
                     response = _parse_anthropic_response(data)
                 elif provider == "ollama":
                     response = _parse_ollama_response(data)
@@ -1525,9 +1563,9 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
     else:
         messages_copy = non_sys
 
-    if provider == "anthropic":
+    if _is_anthropic_like(provider):
         target_url = _normalize_anthropic_url(url)
-        h = _build_anthropic_headers(headers)
+        h = _build_anthropic_headers(headers, oauth=(provider == "claude-subscription"))
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens, stream=True, tools=tools)
     elif provider == "ollama":
         target_url = _normalize_ollama_url(url)
@@ -1703,8 +1741,8 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
             yield f'event: error\ndata: {json.dumps({"error": str(e), "status": 502})}\n\n'
         return
 
-    # ── Anthropic streaming ──
-    if provider == "anthropic":
+    # ── Anthropic streaming (also covers claude-subscription / OAuth bearer) ──
+    if _is_anthropic_like(provider):
         _anth_input_tokens = 0
         _anth_output_tokens = 0
         # Track tool_use blocks: {index: {id, name, arguments_json}}
