@@ -53,16 +53,15 @@ CLAUDE_OAUTH_CLIENT_ID = (
     os.getenv("CLAUDE_OAUTH_CLIENT_ID", "").strip()
     or "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 )
-# Endpoints match the Claude Code CLI / `claude setup-token` OAuth client.
-# console.anthropic.com 301-redirects to platform.claude.com; we target the
-# canonical host directly so the token POST never has to follow a redirect.
-CLAUDE_OAUTH_AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
+# Endpoints + scopes match the Claude Code CLI exactly (extracted from the
+# binary): authorize, token, and redirect all live on platform.claude.com.
+# claude.ai/oauth/authorize does NOT recognize these scopes (it returns
+# "Solicitação OAuth inválida / Escopo desconhecido") — the subscription OAuth
+# for this client goes through platform.claude.com (the Console/platform host).
+CLAUDE_OAUTH_AUTHORIZE_URL = "https://platform.claude.com/oauth/authorize"
 CLAUDE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 CLAUDE_OAUTH_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
-# Subscription/inference scopes. `org:create_api_key` (the Console API-key
-# creation flow) is rejected as an unknown scope on the claude.ai authorize
-# endpoint for this client — the subscription token only needs inference.
-CLAUDE_OAUTH_SCOPES = "user:inference user:profile"
+CLAUDE_OAUTH_SCOPES = "org:create_api_key user:profile user:inference"
 
 # Beta header that authorizes OAuth-bearer access to /v1/messages.
 CLAUDE_OAUTH_BETA = "oauth-2025-04-20"
