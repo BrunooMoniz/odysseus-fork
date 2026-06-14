@@ -1,18 +1,18 @@
-"""Claude Subscription OAuth (PKCE) setup routes.
+"""Claude Subscription setup route.
 
-Two admin-only endpoints drive the manual authorization-code flow:
+The Claude subscription OAuth (``claude setup-token`` / the Claude Code CLI)
+redirects to a localhost loopback, which a browser can't reach for a remote
+server — so the user runs that OAuth locally and pastes the resulting token
+here. One admin-only endpoint validates the token and provisions the endpoint:
 
-  POST /api/claude-subscription/start     -> { authorize_url, state }
-  POST /api/claude-subscription/complete  -> { id, name, base_url, models }
+  POST /api/claude-subscription/complete  (form: token) -> { id, name, base_url, models }
 
-The PKCE verifier never leaves this process; only the access/refresh tokens are
-persisted (encrypted at rest via ProviderAuthSession).
+Only the access/refresh tokens are persisted (encrypted at rest via
+ProviderAuthSession).
 """
 
 import json
 import logging
-import threading
-import time
 import uuid
 from datetime import timedelta
 from typing import Dict, Optional
@@ -26,56 +26,20 @@ from src.auth_helpers import get_current_user
 
 logger = logging.getLogger(__name__)
 
-_PENDING_TTL_SECONDS = 900
 
-
-class _PendingPkceStore:
-    """Thread-safe in-memory PKCE verifier store, keyed by the OAuth ``state``."""
-
-    def __init__(self):
-        self._pending: Dict[str, Dict] = {}
-        self._lock = threading.Lock()
-
-    def _prune(self) -> None:
-        now = time.time()
-        for k in [k for k, v in self._pending.items() if v.get("expires_at", 0) < now]:
-            self._pending.pop(k, None)
-
-    def add(self, state: str, code_verifier: str, owner: Optional[str]) -> None:
-        with self._lock:
-            self._prune()
-            self._pending[state] = {
-                "code_verifier": code_verifier,
-                "owner": owner,
-                "expires_at": time.time() + _PENDING_TTL_SECONDS,
-            }
-
-    def take(self, state: str) -> Optional[Dict]:
-        with self._lock:
-            self._prune()
-            return self._pending.pop(state, None)
-
-
-_PENDING = _PendingPkceStore()
-
-
-def _provision_endpoint(tokens: Dict, owner: Optional[str]) -> Dict:
-    access_token = tokens.get("access_token")
-    refresh_token = tokens.get("refresh_token")
-    if not access_token or not refresh_token:
-        raise ValueError("Claude token response was missing access_token or refresh_token")
+def _provision_endpoint(access_token, refresh_token, expires_at, owner: Optional[str]) -> Dict:
+    if not access_token:
+        raise ValueError("No access token found in the pasted value.")
 
     base = claude_subscription.DEFAULT_CLAUDE_SUBSCRIPTION_BASE_URL
     models = claude_subscription.fetch_available_models(access_token)
     if not models:
-        raise ValueError(
-            "Claude Subscription connected, but no usable Claude models were discovered for this account."
+        raise claude_subscription.ClaudeSubscriptionReauthRequired(
+            "Token did not authorize any Claude models — it may be invalid or expired."
         )
 
-    expires_in = tokens.get("expires_in")
-    expires_at = None
-    if isinstance(expires_in, (int, float)) and expires_in > 0:
-        expires_at = utcnow_naive() + timedelta(seconds=int(expires_in))
+    if expires_at is None:
+        expires_at = utcnow_naive() + timedelta(days=claude_subscription.CLAUDE_DEFAULT_TOKEN_TTL_DAYS)
 
     db = SessionLocal()
     try:
@@ -99,7 +63,7 @@ def _provision_endpoint(tokens: Dict, owner: Optional[str]) -> Dict:
             db.add(auth)
         auth.base_url = base
         auth.access_token = access_token
-        auth.refresh_token = refresh_token
+        auth.refresh_token = refresh_token or ""
         auth.expires_at = expires_at
         auth.last_refresh = utcnow_naive()
         auth.auth_mode = "claude"
@@ -134,12 +98,7 @@ def _provision_endpoint(tokens: Dict, owner: Optional[str]) -> Dict:
         ep.model_refresh_mode = "manual"
         ep.cached_models = json.dumps(models)
         db.commit()
-        result = {
-            "id": ep.id,
-            "name": ep.name,
-            "base_url": ep.base_url,
-            "models": models,
-        }
+        result = {"id": ep.id, "name": ep.name, "base_url": ep.base_url, "models": models}
     finally:
         db.close()
 
@@ -155,29 +114,17 @@ def _provision_endpoint(tokens: Dict, owner: Optional[str]) -> Dict:
 def setup_claude_subscription_routes() -> APIRouter:
     router = APIRouter(prefix="/api/claude-subscription", tags=["claude-subscription"])
 
-    @router.post("/start")
-    def start(request: Request):
-        require_admin(request)
-        pkce = claude_subscription.generate_pkce()
-        _PENDING.add(pkce["state"], pkce["code_verifier"], get_current_user(request) or None)
-        authorize_url = claude_subscription.build_authorize_url(pkce["code_challenge"], pkce["state"])
-        return {"authorize_url": authorize_url, "state": pkce["state"]}
-
     @router.post("/complete")
-    def complete(request: Request, code: str = Form(...), state: str = Form(None)):
+    def complete(request: Request, token: str = Form(...)):
         require_admin(request)
-        pasted_code, pasted_state = claude_subscription.split_pasted_code(code)
-        flow_state = (state or "").strip() or pasted_state
-        if not flow_state:
-            raise HTTPException(400, "Missing OAuth state. Restart the connection.")
-        pending = _PENDING.take(flow_state)
-        if not pending:
-            raise HTTPException(400, "Unknown or expired login session. Restart the connection.")
         try:
-            tokens = claude_subscription.exchange_authorization_code(
-                pasted_code, pasted_state or flow_state, pending["code_verifier"]
-            )
-            result = _provision_endpoint(tokens, pending["owner"])
+            access, refresh, expires_at = claude_subscription.parse_pasted_credentials(token)
+        except Exception as exc:
+            raise claude_subscription.to_http_exception(exc)
+        if not access:
+            raise HTTPException(400, "No token found in the pasted value.")
+        try:
+            result = _provision_endpoint(access, refresh, expires_at, get_current_user(request) or None)
         except Exception as exc:
             logger.exception("Claude Subscription endpoint provisioning failed")
             raise claude_subscription.to_http_exception(exc)

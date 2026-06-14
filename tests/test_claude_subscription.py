@@ -1,9 +1,8 @@
-"""Tests for the Claude (Anthropic) subscription OAuth provider.
+"""Tests for the Claude (Anthropic) subscription token provider.
 
-These import the real helpers from ``src.claude_subscription`` /
-``src.llm_core`` / ``src.endpoint_resolver`` so the provider wiring (detection,
-auth headers, URL building) is actually exercised. OAuth network calls are
-monkeypatched — no real requests are made.
+Imports the real helpers from ``src.claude_subscription`` / ``src.llm_core`` /
+``src.endpoint_resolver`` so the provider wiring (detection, auth headers, URL
+building) is actually exercised. Network calls are monkeypatched.
 """
 
 import json
@@ -54,14 +53,11 @@ class TestDetection:
 class TestUrls:
     def test_normalize_strips_oauth_sentinel(self):
         assert llm_core._normalize_anthropic_url(SENTINEL) == "https://api.anthropic.com/v1/messages"
-        # plain anthropic still works
         assert llm_core._normalize_anthropic_url("https://api.anthropic.com") == "https://api.anthropic.com/v1/messages"
 
     def test_build_chat_url_keeps_subscription_routing(self):
         chat_url = build_chat_url(SENTINEL)
-        # The chat URL must still detect as claude-subscription downstream...
         assert llm_core._detect_provider(chat_url) == "claude-subscription"
-        # ...and normalize to the real messages endpoint at request time.
         assert llm_core._normalize_anthropic_url(chat_url) == "https://api.anthropic.com/v1/messages"
 
     def test_build_models_url(self):
@@ -104,92 +100,47 @@ class TestHeaders:
         assert cs.claude_oauth_headers(None).get("Authorization") is None
 
 
-# ── PKCE / authorize ──
+# ── Pasted-credential parsing ──
 
-class TestPkce:
-    def test_generate_pkce_distinct(self):
-        a = cs.generate_pkce()
-        b = cs.generate_pkce()
-        assert a["code_verifier"] != b["code_verifier"]
-        assert a["state"] != b["state"]
-        assert a["code_challenge"] and a["code_verifier"]
+class TestParse:
+    def test_bare_token(self):
+        access, refresh, expires = cs.parse_pasted_credentials("  sk-ant-oat01-abc  ")
+        assert access == "sk-ant-oat01-abc"
+        assert refresh == ""
+        assert expires is None
 
-    def test_authorize_url_contains_params(self):
-        pkce = cs.generate_pkce()
-        url = cs.build_authorize_url(pkce["code_challenge"], pkce["state"])
-        assert cs.CLAUDE_OAUTH_CLIENT_ID in url
-        assert "code_challenge_method=S256" in url
-        assert pkce["state"] in url
-        assert "code=true" in url
+    def test_keychain_json(self):
+        blob = json.dumps({"claudeAiOauth": {
+            "accessToken": "AAA", "refreshToken": "RRR", "expiresAt": 1781478321055,
+        }})
+        access, refresh, expires = cs.parse_pasted_credentials(blob)
+        assert access == "AAA"
+        assert refresh == "RRR"
+        assert expires is not None and expires.year >= 2026
 
-    def test_split_pasted_code(self):
-        assert cs.split_pasted_code("abc#xyz") == ("abc", "xyz")
-        assert cs.split_pasted_code("  abc#xyz  ") == ("abc", "xyz")
-        assert cs.split_pasted_code("plain") == ("plain", None)
+    def test_flat_snake_case_json(self):
+        blob = json.dumps({"access_token": "X", "refresh_token": "Y"})
+        access, refresh, expires = cs.parse_pasted_credentials(blob)
+        assert (access, refresh, expires) == ("X", "Y", None)
 
+    def test_empty(self):
+        assert cs.parse_pasted_credentials("") == ("", "", None)
 
-# ── Token exchange / refresh request shapes (monkeypatched httpx) ──
-
-class TestTokenRequests:
-    def test_exchange_authorization_code_shape(self, monkeypatch):
-        captured = {}
-
-        def fake_post(url, json=None, headers=None, timeout=None, follow_redirects=None):
-            captured["url"] = url
-            captured["json"] = json
-            return _FakeResp(200, {"access_token": "A", "refresh_token": "R", "expires_in": 28800})
-
-        monkeypatch.setattr(cs.httpx, "post", fake_post)
-        out = cs.exchange_authorization_code("CODE", "STATE", "VERIFIER")
-        assert out["access_token"] == "A"
-        assert captured["url"] == cs.CLAUDE_OAUTH_TOKEN_URL
-        body = captured["json"]
-        assert body["grant_type"] == "authorization_code"
-        assert body["code"] == "CODE"
-        assert body["code_verifier"] == "VERIFIER"
-        assert body["client_id"] == cs.CLAUDE_OAUTH_CLIENT_ID
-        assert body["redirect_uri"] == cs.CLAUDE_OAUTH_REDIRECT_URI
-
-    def test_refresh_oauth_tokens_shape(self, monkeypatch):
-        captured = {}
-
-        def fake_post(url, json=None, headers=None, timeout=None, follow_redirects=None):
-            captured["json"] = json
-            return _FakeResp(200, {"access_token": "A2", "expires_in": 28800})
-
-        monkeypatch.setattr(cs.httpx, "post", fake_post)
-        out = cs.refresh_oauth_tokens("REFRESH")
-        assert out["access_token"] == "A2"
-        body = captured["json"]
-        assert body["grant_type"] == "refresh_token"
-        assert body["refresh_token"] == "REFRESH"
-        assert body["client_id"] == cs.CLAUDE_OAUTH_CLIENT_ID
-
-    def test_refresh_without_token_raises_reauth(self):
+    def test_bad_json_raises(self):
         with pytest.raises(cs.ClaudeSubscriptionReauthRequired):
-            cs.refresh_oauth_tokens("")
-
-    def test_exchange_rate_limited_maps(self, monkeypatch):
-        def fake_post(url, json=None, headers=None, timeout=None, follow_redirects=None):
-            return _FakeResp(429, {"error": {"type": "rate_limit_error", "message": "slow"}})
-
-        monkeypatch.setattr(cs.httpx, "post", fake_post)
-        with pytest.raises(cs.ClaudeSubscriptionRateLimited):
-            cs.exchange_authorization_code("C", "S", "V")
+            cs.parse_pasted_credentials("{not valid json")
 
 
-# ── Model discovery (monkeypatched httpx) ──
+# ── Model discovery ──
 
 class TestModelDiscovery:
     def test_fetch_available_models_filters_claude(self, monkeypatch):
-        payload = {
-            "data": [
-                {"id": "claude-opus-4-8"},
-                {"id": "claude-haiku-4-5-20251001"},
-                {"id": "not-a-claude-model"},
-                {"id": "claude-sonnet-4-6"},
-            ]
-        }
+        payload = {"data": [
+            {"id": "claude-opus-4-8"},
+            {"id": "claude-haiku-4-5-20251001"},
+            {"id": "not-a-claude-model"},
+            {"id": "claude-sonnet-4-6"},
+        ]}
 
         def fake_get(url, headers=None, timeout=None):
             assert "/v1/models" in url
@@ -197,16 +148,38 @@ class TestModelDiscovery:
             return _FakeResp(200, payload)
 
         monkeypatch.setattr(cs.httpx, "get", fake_get)
-        models = cs.fetch_available_models("ACCESS")
-        assert models == ["claude-opus-4-8", "claude-haiku-4-5-20251001", "claude-sonnet-4-6"]
+        assert cs.fetch_available_models("ACCESS") == [
+            "claude-opus-4-8", "claude-haiku-4-5-20251001", "claude-sonnet-4-6",
+        ]
 
     def test_fetch_available_models_empty_on_error(self, monkeypatch):
-        def fake_get(url, headers=None, timeout=None):
-            return _FakeResp(401, {})
-
-        monkeypatch.setattr(cs.httpx, "get", fake_get)
+        monkeypatch.setattr(cs.httpx, "get", lambda *a, **k: _FakeResp(401, {}))
         assert cs.fetch_available_models("ACCESS") == []
         assert cs.fetch_available_models("") == []
+
+
+# ── Refresh (only used when a refresh token was provided) ──
+
+class TestRefresh:
+    def test_refresh_shape(self, monkeypatch):
+        captured = {}
+
+        def fake_post(url, json=None, headers=None, timeout=None, follow_redirects=None):
+            captured["url"] = url
+            captured["json"] = json
+            return _FakeResp(200, {"access_token": "A2", "expires_in": 28800})
+
+        monkeypatch.setattr(cs.httpx, "post", fake_post)
+        out = cs.refresh_oauth_tokens("REFRESH")
+        assert out["access_token"] == "A2"
+        assert captured["url"] == cs.CLAUDE_OAUTH_TOKEN_URL
+        assert captured["json"]["grant_type"] == "refresh_token"
+        assert captured["json"]["refresh_token"] == "REFRESH"
+        assert captured["json"]["client_id"] == cs.CLAUDE_OAUTH_CLIENT_ID
+
+    def test_refresh_without_token_raises(self):
+        with pytest.raises(cs.ClaudeSubscriptionReauthRequired):
+            cs.refresh_oauth_tokens("")
 
 
 # ── Expiry decision (pure) ──
@@ -218,11 +191,7 @@ class TestExpiry:
         def now():
             return datetime(2026, 1, 1, 12, 0, 0)
 
-        # No expiry stored -> treat as expiring.
         assert cs._access_token_is_expiring(None, now, 300) is True
-        # Far future -> not expiring.
         assert cs._access_token_is_expiring(now() + timedelta(hours=2), now, 300) is False
-        # Within skew -> expiring.
         assert cs._access_token_is_expiring(now() + timedelta(seconds=60), now, 300) is True
-        # Past -> expiring.
         assert cs._access_token_is_expiring(now() - timedelta(seconds=1), now, 300) is True

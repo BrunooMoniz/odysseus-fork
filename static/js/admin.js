@@ -1051,8 +1051,9 @@ function initEndpointForm() {
   });
 
   async function _startClaudeSubscriptionAuth(triggerEl = null) {
-    // Claude subscription uses OAuth Authorization Code + PKCE with a manual
-    // code paste (not a device flow), so it has its own start/complete runner.
+    // The Claude subscription OAuth (claude setup-token / the Claude Code CLI)
+    // redirects to a localhost loopback that a browser can't reach for a remote
+    // server, so the user runs it locally and pastes the resulting token here.
     if (deviceAuthPolling) return;
     const status = el('adm-deviceAuthStatus') || _endpointMsg('api');
     if (!status) return;
@@ -1064,53 +1065,30 @@ function initEndpointForm() {
     };
     const showAuthError = (text) => {
       status.className = 'admin-error';
-      status.textContent = text + ' ';
-      const retry = document.createElement('button');
-      retry.type = 'button';
-      retry.className = 'admin-btn-sm';
-      retry.textContent = 'Try again';
-      retry.addEventListener('click', () => { _startClaudeSubscriptionAuth(triggerEl); });
-      status.appendChild(retry);
+      status.textContent = text;
     };
-    status.textContent = '';
-    status.className = 'adm-ep-inline-msg';
-    if (triggerEl) { triggerEl.disabled = true; triggerEl.textContent = 'Starting...'; }
     deviceAuthPolling = true;
     _setApiFormForProvider();
-    status.textContent = 'Starting Claude Subscription sign-in...';
-
-    let startData;
-    try {
-      const res = await fetch('/api/claude-subscription/start', { method: 'POST', credentials: 'same-origin' });
-      if (!res.ok) throw new Error('start failed (' + res.status + ')');
-      startData = await res.json();
-    } catch (e) {
-      reset();
-      showAuthError('Could not start sign-in (' + (e && e.message ? e.message : 'request failed') + ').');
-      return;
-    }
-
-    if (triggerEl) triggerEl.textContent = 'Waiting...';
+    if (triggerEl) triggerEl.textContent = 'Paste token';
     status.className = '';
     status.innerHTML =
       '<div class="adm-copilot-panel">' +
-        '<div class="adm-copilot-wait"><span>Sign in, then paste the code Anthropic shows you.</span></div>' +
-        '<a class="admin-btn-add adm-copilot-auth" href="' + encodeURI(startData.authorize_url || '') + '" target="_blank" rel="noopener">Authorize with Claude ↗</a>' +
+        '<div class="adm-copilot-wait"><span>Run <code>claude setup-token</code> in your terminal, then paste the token it gives you (or your Claude Code credential JSON).</span></div>' +
         '<div class="adm-copilot-coderow">' +
-          '<input type="text" class="adm-claude-code" placeholder="Paste code here" style="flex:1;min-width:0;" />' +
+          '<input type="text" class="adm-claude-token" placeholder="Paste Claude token" style="flex:1;min-width:0;" autocomplete="off" />' +
           '<button type="button" class="admin-btn-sm adm-claude-connect">Connect</button>' +
         '</div>' +
       '</div>';
-    const input = status.querySelector('.adm-claude-code');
+    const input = status.querySelector('.adm-claude-token');
     const connectBtn = status.querySelector('.adm-claude-connect');
+    if (input) input.focus();
     const doComplete = async () => {
-      const code = (input.value || '').trim();
-      if (!code) { input.focus(); return; }
+      const token = (input.value || '').trim();
+      if (!token) { input.focus(); return; }
       connectBtn.disabled = true; connectBtn.textContent = 'Connecting...';
       try {
         const fd = new FormData();
-        fd.append('code', code);
-        fd.append('state', startData.state || '');
+        fd.append('token', token);
         const res = await fetch('/api/claude-subscription/complete', { method: 'POST', body: fd, credentials: 'same-origin' });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error((data && data.detail) || ('HTTP ' + res.status));

@@ -1,19 +1,20 @@
-"""Claude (Anthropic) subscription OAuth helpers.
+"""Claude (Anthropic) subscription token provider.
 
-This provider lets an Odysseus admin sign in with their Claude Pro/Max
-**subscription** (the same OAuth grant `claude setup-token` / the Claude Code
-CLI use) instead of a pay-per-token Anthropic API key. It stores the OAuth
-refresh token server-side and resolves a fresh access token at request time.
+Lets an Odysseus admin use their Claude Pro/Max **subscription** for inference
+instead of a pay-per-token Anthropic API key, by pasting a Claude Code OAuth
+token (run ``claude setup-token`` locally, or paste the credential JSON Claude
+Code stores). Mirrors the existing ChatGPT Subscription provider.
+
+Why paste a token instead of an in-app OAuth flow: the Claude subscription
+OAuth (``claude setup-token`` / the Claude Code CLI) redirects to a
+``http://localhost:PORT/callback`` loopback, which a browser cannot reach for a
+*remote* server. So the user runs the OAuth where the loopback works (their own
+machine) and pastes the resulting token here.
 
 Auth differs from the API-key Anthropic provider in exactly one way: requests
-carry ``Authorization: Bearer <access_token>`` plus the
-``anthropic-beta: oauth-2025-04-20`` header instead of ``x-api-key``. Everything
-else (the /v1/messages payload, response parsing, streaming) is shared with the
-existing Anthropic path in ``src/llm_core.py``.
-
-The flow is the standard OAuth 2.0 Authorization Code + PKCE grant with a manual
-code paste (Anthropic shows a ``<code>#<state>`` string after sign-in), so it
-does not use the device-flow scaffolding the ChatGPT subscription provider uses.
+carry ``Authorization: Bearer <token>`` plus ``anthropic-beta: oauth-2025-04-20``
+instead of ``x-api-key``. Everything else (the /v1/messages payload, response
+parsing, streaming) is shared with the Anthropic path in ``src/llm_core.py``.
 
 Note on terms of service: a subscription is intended for first-party Claude
 surfaces (Claude apps, Claude Code). Routing a third-party app through it is a
@@ -23,13 +24,11 @@ mechanism is symmetric with the existing ChatGPT Subscription provider.
 
 from __future__ import annotations
 
-import base64
-import hashlib
+import json
 import os
-import secrets
 import threading
-from datetime import timedelta
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import HTTPException
@@ -48,31 +47,24 @@ ANTHROPIC_API_BASE = (
 # ANTHROPIC_API_BASE when the real /v1/messages or /v1/models URL is built.
 DEFAULT_CLAUDE_SUBSCRIPTION_BASE_URL = f"{ANTHROPIC_API_BASE}/oauth"
 
-# Public OAuth client used by the Claude Code CLI / `claude setup-token`.
+# Public OAuth client used by the Claude Code CLI / `claude setup-token`. Only
+# used to refresh a token that was pasted together with a refresh token.
 CLAUDE_OAUTH_CLIENT_ID = (
     os.getenv("CLAUDE_OAUTH_CLIENT_ID", "").strip()
     or "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 )
-# Endpoints + scopes match the Claude Code CLI exactly (extracted from the
-# binary): authorize, token, and redirect all live on platform.claude.com.
-# claude.ai/oauth/authorize does NOT recognize these scopes (it returns
-# "Solicitação OAuth inválida / Escopo desconhecido") — the subscription OAuth
-# for this client goes through platform.claude.com (the Console/platform host).
-CLAUDE_OAUTH_AUTHORIZE_URL = "https://platform.claude.com/oauth/authorize"
 CLAUDE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
-CLAUDE_OAUTH_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
-# Inference scopes only. `org:create_api_key` is the CLI's "create an API key"
-# mode and is rejected as an unknown scope on the subscription authorize flow
-# (the real subscription token is granted user:inference + user:profile, never
-# org:create_api_key).
-CLAUDE_OAUTH_SCOPES = "user:inference user:profile"
 
-# Beta header that authorizes OAuth-bearer access to /v1/messages.
+# Beta header that authorizes an OAuth-bearer token on /v1/messages.
 CLAUDE_OAUTH_BETA = "oauth-2025-04-20"
 ANTHROPIC_VERSION = "2023-06-01"
 
 # Refresh the access token this many seconds before it actually expires.
 CLAUDE_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 300
+# Tokens pasted without an explicit expiry (e.g. `claude setup-token`, ~1 year)
+# get this lifetime so the resolver never tries to refresh a non-refreshable
+# token. It is validated against /v1/models at connect time regardless.
+CLAUDE_DEFAULT_TOKEN_TTL_DAYS = 365
 
 _AUTH_REFRESH_LOCKS: dict[str, threading.Lock] = {}
 _AUTH_REFRESH_LOCKS_GUARD = threading.Lock()
@@ -98,7 +90,7 @@ class ClaudeSubscriptionError(RuntimeError):
 
 
 class ClaudeSubscriptionReauthRequired(ClaudeSubscriptionError):
-    """Stored OAuth credentials are invalid or expired beyond refresh."""
+    """Stored credentials are invalid/expired beyond refresh; reconnect needed."""
 
 
 class ClaudeSubscriptionRateLimited(ClaudeSubscriptionError):
@@ -141,124 +133,41 @@ def claude_oauth_headers(access_token: Optional[str]) -> Dict[str, str]:
     return headers
 
 
-# ── PKCE / authorization-code flow ──
+# ── Pasted-credential parsing ──
 
-def _b64url(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+def parse_pasted_credentials(text: str) -> Tuple[str, str, Optional[datetime]]:
+    """Parse a pasted Claude token into (access_token, refresh_token, expires_at).
 
-
-def generate_pkce() -> Dict[str, str]:
-    """Return a fresh PKCE verifier/challenge and an anti-CSRF state."""
-    verifier = _b64url(os.urandom(32))
-    challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
-    state = secrets.token_urlsafe(24)
-    return {"code_verifier": verifier, "code_challenge": challenge, "state": state}
-
-
-def build_authorize_url(code_challenge: str, state: str) -> str:
-    """Build the Claude OAuth authorize URL for the manual-code grant."""
-    from urllib.parse import urlencode
-
-    params = {
-        "code": "true",
-        "client_id": CLAUDE_OAUTH_CLIENT_ID,
-        "response_type": "code",
-        "redirect_uri": CLAUDE_OAUTH_REDIRECT_URI,
-        "scope": CLAUDE_OAUTH_SCOPES,
-        "code_challenge": code_challenge,
-        "code_challenge_method": "S256",
-        "state": state,
-    }
-    return f"{CLAUDE_OAUTH_AUTHORIZE_URL}?{urlencode(params)}"
-
-
-def split_pasted_code(pasted: str) -> tuple[str, Optional[str]]:
-    """Split the ``<code>#<state>`` string Anthropic shows after sign-in."""
-    pasted = (pasted or "").strip()
-    if "#" in pasted:
-        code, _, state = pasted.partition("#")
-        return code.strip(), (state.strip() or None)
-    return pasted, None
-
-
-def _raise_for_oauth_response(response: httpx.Response, action: str) -> None:
-    if response.status_code < 400:
-        return
-    code = ""
-    message = f"Claude Subscription {action} failed with HTTP {response.status_code}."
-    try:
-        payload = response.json()
-        err = payload.get("error") if isinstance(payload, dict) else None
-        if isinstance(err, dict):
-            code = str(err.get("type") or err.get("code") or "").strip()
-            msg = err.get("message")
-            if msg:
-                message = f"Claude Subscription {action} failed: {msg}"
-        elif isinstance(err, str):
-            code = err.strip()
-            desc = payload.get("error_description") or payload.get("message")
-            if desc:
-                message = f"Claude Subscription {action} failed: {desc}"
-    except Exception:
-        pass
-    if response.status_code == 429:
-        raise ClaudeSubscriptionRateLimited(
-            "Claude Subscription quota or rate limit was reached. Credentials are still valid."
-        )
-    if response.status_code in (400, 401, 403) or code in {
-        "invalid_grant",
-        "invalid_token",
-        "invalid_request",
-        "unauthorized",
-    }:
-        raise ClaudeSubscriptionReauthRequired(message)
-    raise ClaudeSubscriptionError(message)
-
-
-def _token_request(payload: Dict[str, Any], action: str, timeout: float = 20.0) -> Dict[str, Any]:
-    response = httpx.post(
-        CLAUDE_OAUTH_TOKEN_URL,
-        json=payload,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        timeout=timeout,
-        follow_redirects=True,
-    )
-    _raise_for_oauth_response(response, action)
-    try:
-        data = response.json()
-    except Exception as exc:
-        raise ClaudeSubscriptionError(f"Claude Subscription {action} returned invalid JSON.") from exc
-    if not isinstance(data, dict) or not data.get("access_token"):
-        raise ClaudeSubscriptionReauthRequired(f"Claude Subscription {action} did not return an access token.")
-    return data
-
-
-def exchange_authorization_code(code: str, state: Optional[str], code_verifier: str) -> Dict[str, Any]:
-    payload = {
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": CLAUDE_OAUTH_REDIRECT_URI,
-        "client_id": CLAUDE_OAUTH_CLIENT_ID,
-        "code_verifier": code_verifier,
-    }
-    if state:
-        payload["state"] = state
-    return _token_request(payload, "token exchange")
-
-
-def refresh_oauth_tokens(refresh_token: str) -> Dict[str, Any]:
-    if not refresh_token:
-        raise ClaudeSubscriptionReauthRequired(
-            "Claude Subscription is missing a refresh token. Reconnect the provider."
-        )
-    return _token_request(
-        {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": CLAUDE_OAUTH_CLIENT_ID,
-        },
-        "token refresh",
-    )
+    Accepts either a bare access token (``sk-ant-oat01-…`` from
+    ``claude setup-token``) or the credential JSON Claude Code stores
+    (``{"claudeAiOauth": {"accessToken", "refreshToken", "expiresAt"}}`` or a
+    flat ``{"access_token", ...}``). ``expires_at`` is naive UTC, or None when
+    the pasted value carries no expiry.
+    """
+    text = (text or "").strip()
+    if not text:
+        return "", "", None
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except Exception as exc:
+            raise ClaudeSubscriptionReauthRequired(
+                "Pasted value is not a valid token or credential JSON."
+            ) from exc
+        obj = data.get("claudeAiOauth") if isinstance(data.get("claudeAiOauth"), dict) else data
+        access = (obj.get("accessToken") or obj.get("access_token") or "").strip()
+        refresh = (obj.get("refreshToken") or obj.get("refresh_token") or "").strip()
+        raw_exp = obj.get("expiresAt") or obj.get("expires_at")
+        expires_at = None
+        if isinstance(raw_exp, (int, float)) and raw_exp > 0:
+            secs = raw_exp / 1000.0 if raw_exp > 1e12 else float(raw_exp)
+            try:
+                expires_at = datetime.fromtimestamp(secs, tz=timezone.utc).replace(tzinfo=None)
+            except Exception:
+                expires_at = None
+        return access, refresh, expires_at
+    # Bare access token.
+    return text, "", None
 
 
 # ── Model discovery ──
@@ -291,6 +200,39 @@ def fetch_available_models(access_token: str, timeout: float = 12.0) -> List[str
             ordered.append(mid)
             seen.add(mid)
     return ordered
+
+
+# ── Token refresh (only when a refresh token was provided) ──
+
+def refresh_oauth_tokens(refresh_token: str, timeout: float = 20.0) -> Dict[str, Any]:
+    if not refresh_token:
+        raise ClaudeSubscriptionReauthRequired(
+            "Claude Subscription has no refresh token. Reconnect with a fresh token."
+        )
+    response = httpx.post(
+        CLAUDE_OAUTH_TOKEN_URL,
+        json={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CLAUDE_OAUTH_CLIENT_ID,
+        },
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        timeout=timeout,
+        follow_redirects=True,
+    )
+    if response.status_code == 429:
+        raise ClaudeSubscriptionRateLimited("Claude Subscription rate limit hit during refresh.")
+    if response.status_code >= 400:
+        raise ClaudeSubscriptionReauthRequired(
+            f"Claude Subscription token refresh failed (HTTP {response.status_code}). Reconnect."
+        )
+    try:
+        data = response.json()
+    except Exception as exc:
+        raise ClaudeSubscriptionError("Claude Subscription refresh returned invalid JSON.") from exc
+    if not isinstance(data, dict) or not data.get("access_token"):
+        raise ClaudeSubscriptionReauthRequired("Claude Subscription refresh returned no access token.")
+    return data
 
 
 # ── Runtime credential resolution (refresh-aware) ──
@@ -326,15 +268,17 @@ def resolve_runtime_credentials(
         expiring = force_refresh or _access_token_is_expiring(
             getattr(row, "expires_at", None), utcnow_naive, CLAUDE_ACCESS_TOKEN_REFRESH_SKEW_SECONDS
         )
-        if expiring:
+        # Only a token pasted *with* a refresh token can be refreshed; a bare
+        # `claude setup-token` token cannot, so it's used until it expires.
+        if expiring and (row.refresh_token or "").strip():
             with _refresh_lock_for(auth_id):
                 db.refresh(row)
                 expiring = force_refresh or _access_token_is_expiring(
                     getattr(row, "expires_at", None), utcnow_naive,
                     CLAUDE_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
                 )
-                if expiring:
-                    refreshed = refresh_oauth_tokens(row.refresh_token or "")
+                if expiring and (row.refresh_token or "").strip():
+                    refreshed = refresh_oauth_tokens(row.refresh_token)
                     row.access_token = refreshed["access_token"]
                     if refreshed.get("refresh_token"):
                         row.refresh_token = refreshed["refresh_token"]
