@@ -59,7 +59,10 @@ CLAUDE_OAUTH_CLIENT_ID = (
 CLAUDE_OAUTH_AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
 CLAUDE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 CLAUDE_OAUTH_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
-CLAUDE_OAUTH_SCOPES = "org:create_api_key user:profile user:inference"
+# Subscription/inference scopes. `org:create_api_key` (the Console API-key
+# creation flow) is rejected as an unknown scope on the claude.ai authorize
+# endpoint for this client — the subscription token only needs inference.
+CLAUDE_OAUTH_SCOPES = "user:inference user:profile"
 
 # Beta header that authorizes OAuth-bearer access to /v1/messages.
 CLAUDE_OAUTH_BETA = "oauth-2025-04-20"
