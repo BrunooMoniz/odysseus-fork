@@ -131,6 +131,49 @@ class TestPayload:
         assert all(_IDENTITY not in b.get("text", "") for b in p.get("system", []))
 
 
+# ── Effort gating + payload ──
+
+class TestEffort:
+    def test_supports_effort_matrix(self):
+        sup = llm_core._anthropic_supports_effort
+        assert sup("claude-opus-4-8")
+        assert sup("claude-opus-4-5-20251101")
+        assert sup("claude-sonnet-4-6")
+        assert sup("claude-fable-5")
+        assert not sup("claude-opus-4-1-20250805")     # 4.1 < 4.5
+        assert not sup("claude-opus-4-20250514")       # 4.0 (dated) < 4.5
+        assert not sup("claude-sonnet-4-5-20250929")   # sonnet 4.5 < 4.6
+        assert not sup("claude-haiku-4-5-20251001")
+        assert not sup("gpt-4o")
+
+    def test_effort_payload_on_supported_model(self):
+        p = llm_core._build_anthropic_payload(
+            "claude-opus-4-8", [{"role": "user", "content": "hi"}], 0.7, 64, effort="high"
+        )
+        assert p["output_config"] == {"effort": "high"}
+        assert p["thinking"] == {"type": "adaptive"}
+        assert "temperature" not in p  # omitted on the effort path
+
+    def test_effort_ignored_on_unsupported_model(self):
+        p = llm_core._build_anthropic_payload(
+            "claude-haiku-4-5-20251001", [{"role": "user", "content": "hi"}], 0.7, 64, effort="high"
+        )
+        assert "output_config" not in p
+        assert p.get("temperature") == 0.7  # haiku still takes temperature
+
+    def test_invalid_effort_ignored(self):
+        p = llm_core._build_anthropic_payload(
+            "claude-opus-4-8", [{"role": "user", "content": "hi"}], 0.7, 64, effort="turbo"
+        )
+        assert "output_config" not in p
+
+    def test_no_effort_is_unchanged(self):
+        p = llm_core._build_anthropic_payload(
+            "claude-opus-4-8", [{"role": "user", "content": "hi"}], 0.7, 64
+        )
+        assert "output_config" not in p
+
+
 # ── Pasted-credential parsing ──
 
 class TestParse:

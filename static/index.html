@@ -810,6 +810,13 @@
         <div id="models">
           <div class="models-row">
             <select id="model-select" aria-label="Select model" style="flex: 1; padding: 6px 8px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg); color: var(--fg);"></select>
+            <select id="effort-select" aria-label="Reasoning effort" title="Reasoning effort — applies to Claude Opus 4.5+/Sonnet 4.6+ (ignored by other models)" style="padding: 6px 8px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg); color: var(--fg);">
+              <option value="">Effort: Auto</option>
+              <option value="low">Effort: Low</option>
+              <option value="medium">Effort: Medium</option>
+              <option value="high">Effort: High</option>
+              <option value="max">Effort: Max</option>
+            </select>
             <button type="button" id="btn-model-chat" class="model-chat-btn" aria-label="Add model chat" style="transition: all 0.2s ease;"><span class="model-chat-btn-label">+ Chat</span></button>
           </div>
         </div>
