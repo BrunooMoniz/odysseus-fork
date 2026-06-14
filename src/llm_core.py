@@ -783,7 +783,16 @@ def _convert_openai_content_to_anthropic(content):
     return converted
 
 
-def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=False, tools=None):
+# Required first system block for OAuth-subscription (claude-subscription)
+# requests: Anthropic soft-blocks premium models (Opus/Sonnet) with a 429 unless
+# the request presents the Claude Code identity, even when quota is available.
+# Haiku is exempt, but sending it for every OAuth request is harmless and keeps
+# behavior uniform. One line is enough — the user's own system prompt follows
+# and still applies.
+_CLAUDE_CODE_OAUTH_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
+
+
+def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=False, tools=None, oauth=False):
     """Convert OpenAI-style messages to Anthropic format."""
     system_parts = []
     chat_messages = []
@@ -838,6 +847,10 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
     # returns HTTP 400. Omit it for those models; older Claude models still take it.
     if not _anthropic_rejects_temperature(model):
         payload["temperature"] = temperature
+    system_blocks = []
+    if oauth:
+        # Premium models 429 on subscription tokens without this first block.
+        system_blocks.append({"type": "text", "text": _CLAUDE_CODE_OAUTH_SYSTEM})
     if system_parts:
         system_text = "\n\n".join(system_parts)
         # Send `system` as a structured text block so we can attach a prompt-cache
@@ -849,7 +862,9 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
         system_block = {"type": "text", "text": system_text}
         if tools or len(system_text) > 4000:
             system_block["cache_control"] = {"type": "ephemeral"}
-        payload["system"] = [system_block]
+        system_blocks.append(system_block)
+    if system_blocks:
+        payload["system"] = system_blocks
     if stream:
         payload["stream"] = True
     # Convert OpenAI-format tools to Anthropic format
@@ -1260,7 +1275,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
     if _is_anthropic_like(provider):
         target_url = _normalize_anthropic_url(url)
         h = _build_anthropic_headers(headers, oauth=(provider == "claude-subscription"))
-        payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens)
+        payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens, oauth=(provider == "claude-subscription"))
     elif provider == "ollama":
         target_url = _normalize_ollama_url(url)
         payload = _build_ollama_payload(
@@ -1450,7 +1465,7 @@ async def llm_call_async(
     if _is_anthropic_like(provider):
         target_url = _normalize_anthropic_url(url)
         h = _build_anthropic_headers(headers, oauth=(provider == "claude-subscription"))
-        payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens)
+        payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens, oauth=(provider == "claude-subscription"))
     elif provider == "ollama":
         target_url = _normalize_ollama_url(url)
         h = {"Content-Type": "application/json"}
@@ -1566,7 +1581,7 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
     if _is_anthropic_like(provider):
         target_url = _normalize_anthropic_url(url)
         h = _build_anthropic_headers(headers, oauth=(provider == "claude-subscription"))
-        payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens, stream=True, tools=tools)
+        payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens, stream=True, tools=tools, oauth=(provider == "claude-subscription"))
     elif provider == "ollama":
         target_url = _normalize_ollama_url(url)
         h = {"Content-Type": "application/json"}

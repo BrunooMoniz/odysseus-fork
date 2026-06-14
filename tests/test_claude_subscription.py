@@ -100,6 +100,30 @@ class TestHeaders:
         assert cs.claude_oauth_headers(None).get("Authorization") is None
 
 
+# ── Payload (OAuth identity injection) ──
+
+_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+
+
+class TestPayload:
+    def test_oauth_prepends_identity(self):
+        p = llm_core._build_anthropic_payload(
+            "claude-opus-4-8", [{"role": "user", "content": "hi"}], 0.0, 16, oauth=True
+        )
+        assert p["system"][0]["text"] == _IDENTITY
+
+    def test_oauth_keeps_user_system_after_identity(self):
+        msgs = [{"role": "system", "content": "You are a pirate."}, {"role": "user", "content": "hi"}]
+        p = llm_core._build_anthropic_payload("claude-opus-4-8", msgs, 0.0, 16, oauth=True)
+        assert p["system"][0]["text"] == _IDENTITY
+        assert any("pirate" in b.get("text", "") for b in p["system"][1:])
+
+    def test_non_oauth_has_no_identity(self):
+        msgs = [{"role": "system", "content": "You are a pirate."}, {"role": "user", "content": "hi"}]
+        p = llm_core._build_anthropic_payload("claude-opus-4-8", msgs, 0.0, 16, oauth=False)
+        assert all(_IDENTITY not in b.get("text", "") for b in p.get("system", []))
+
+
 # ── Pasted-credential parsing ──
 
 class TestParse:
