@@ -791,6 +791,19 @@ def _convert_openai_content_to_anthropic(content):
 # and still applies.
 _CLAUDE_CODE_OAUTH_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
 
+# The identity line above is required only to pass Anthropic's gate, but it
+# primes terse, coding-CLI behavior. This second block re-frames the model as a
+# general claude.ai-style chat assistant. It goes AFTER the identity and BEFORE
+# the user's own system prompt, which still takes precedence.
+_CLAUDE_CODE_OAUTH_REFRAME = (
+    "You are operating as a general-purpose AI assistant in a chat interface, "
+    "not a terminal or a coding session. Be warm, clear, and genuinely helpful "
+    "across any topic the user brings up (writing, analysis, advice, coding, or "
+    "casual conversation), the way Claude responds on claude.ai. Explain your "
+    "reasoning when it helps and match the user's tone and language. Any "
+    "instructions or persona the user provides below take precedence over this."
+)
+
 
 def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=False, tools=None, oauth=False):
     """Convert OpenAI-style messages to Anthropic format."""
@@ -849,8 +862,10 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
         payload["temperature"] = temperature
     system_blocks = []
     if oauth:
-        # Premium models 429 on subscription tokens without this first block.
+        # Premium models 429 on subscription tokens without this first block;
+        # the reframe block restores general claude.ai-style chat behavior.
         system_blocks.append({"type": "text", "text": _CLAUDE_CODE_OAUTH_SYSTEM})
+        system_blocks.append({"type": "text", "text": _CLAUDE_CODE_OAUTH_REFRAME})
     if system_parts:
         system_text = "\n\n".join(system_parts)
         # Send `system` as a structured text block so we can attach a prompt-cache

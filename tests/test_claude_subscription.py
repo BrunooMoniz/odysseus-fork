@@ -112,11 +112,18 @@ class TestPayload:
         )
         assert p["system"][0]["text"] == _IDENTITY
 
-    def test_oauth_keeps_user_system_after_identity(self):
+    def test_oauth_reframe_block_after_identity(self):
+        p = llm_core._build_anthropic_payload(
+            "claude-opus-4-8", [{"role": "user", "content": "hi"}], 0.0, 16, oauth=True
+        )
+        assert "claude.ai" in p["system"][1]["text"]
+
+    def test_oauth_keeps_user_system_after_identity_and_reframe(self):
         msgs = [{"role": "system", "content": "You are a pirate."}, {"role": "user", "content": "hi"}]
         p = llm_core._build_anthropic_payload("claude-opus-4-8", msgs, 0.0, 16, oauth=True)
-        assert p["system"][0]["text"] == _IDENTITY
-        assert any("pirate" in b.get("text", "") for b in p["system"][1:])
+        assert p["system"][0]["text"] == _IDENTITY            # identity first
+        assert "claude.ai" in p["system"][1]["text"]          # reframe second
+        assert p["system"][2]["text"] == "You are a pirate."  # user system last
 
     def test_non_oauth_has_no_identity(self):
         msgs = [{"role": "system", "content": "You are a pirate."}, {"role": "user", "content": "hi"}]
