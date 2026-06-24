@@ -87,6 +87,38 @@ PLAN_MODE_READONLY_TOOLS = {
 }
 
 
+# The core agentic toolkit (the "files"/shell domain). It is ALWAYS offered in
+# agent mode so a vague prompt ("test", "oi") still reaches a real terminal agent.
+# RAG/domain tool selection (tool_index, _detect_domains) only ever ADDS domain
+# tools (email, calendar, web, ...) on top of this — it must never hide the core.
+# This is the single source of truth for the files domain; agent_loop's
+# _DOMAIN_TOOL_MAP["files"] reuses it.
+CORE_AGENT_TOOLS = frozenset({
+    "bash", "python", "read_file", "write_file", "edit_file",
+    "grep", "glob", "ls", "get_workspace",
+})
+
+
+def augment_with_core_tools(
+    relevant: Set[str], *, plan_mode: bool, guide_only: bool
+) -> Set[str]:
+    """Force-include the core agentic toolkit for an agent turn's selected tools.
+
+    - guide_only is advisory (the agent explains, never executes), so the selected
+      set is returned UNCHANGED — we never tempt the model with executable tools.
+    - plan_mode injects only the read-only core tools (read_file/grep/glob/ls/
+      get_workspace); bash/python/write_file/edit_file stay out (and the plan-mode
+      denylist blocks them at execution anyway).
+    - otherwise the full core toolkit is added.
+
+    Never mutates the caller's set.
+    """
+    if guide_only:
+        return relevant
+    core = (CORE_AGENT_TOOLS & PLAN_MODE_READONLY_TOOLS) if plan_mode else CORE_AGENT_TOOLS
+    return set(relevant) | set(core)
+
+
 # The agent's tool gate is a DENYLIST: execute_tool_block blocks any tool whose
 # name is in `disabled_tools`. Plan mode's policy is the opposite — an allowlist
 # (PLAN_MODE_READONLY_TOOLS). To apply an allowlist through a denylist, plan mode

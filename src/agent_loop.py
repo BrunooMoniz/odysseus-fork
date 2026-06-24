@@ -19,7 +19,12 @@ from src.llm_core import stream_llm, stream_llm_with_fallback, _is_ollama_native
 from src.model_context import estimate_tokens
 from src.settings import get_setting
 from src.prompt_security import untrusted_context_message
-from src.tool_security import blocked_tools_for_owner, plan_mode_disabled_tools
+from src.tool_security import (
+    blocked_tools_for_owner,
+    plan_mode_disabled_tools,
+    augment_with_core_tools,
+    CORE_AGENT_TOOLS,
+)
 from src.tool_policy import GUIDE_ONLY_DIRECTIVE, ToolPolicy
 from src.tool_utils import _truncate, get_mcp_manager
 from src.agent_tools import (
@@ -272,7 +277,7 @@ _DOMAIN_TOOL_MAP = {
     "notes_calendar_tasks": {"manage_notes", "manage_calendar", "manage_tasks"},
     "ui": {"ui_control"},
     "sessions": {"create_session", "list_sessions", "manage_session", "send_to_session", "search_chats"},
-    "files": {"bash", "python", "read_file", "write_file", "edit_file", "grep", "glob", "ls", "get_workspace"},
+    "files": set(CORE_AGENT_TOOLS),  # single source of truth: tool_security.CORE_AGENT_TOOLS
     "settings": {"manage_settings", "manage_endpoints", "manage_mcp", "manage_webhooks", "manage_tokens", "app_api"},
 }
 
@@ -1888,6 +1893,13 @@ async def stream_agent_loop(
         _relevant_tools.update({"edit_document", "update_document", "suggest_document"})
 
     if _relevant_tools is not None:
+        # Cure the tool gating: the core terminal toolkit (bash/files/...) is
+        # ALWAYS offered in agent mode so a vague prompt still reaches a real
+        # agent. Read-only subset in plan mode; untouched in guide_only. The
+        # RAG/domain selection above only ADDS domain tools on top of this.
+        _relevant_tools = augment_with_core_tools(
+            _relevant_tools, plan_mode=plan_mode, guide_only=guide_only
+        )
         logger.info("[agent-intent] selected_tools=%s", sorted(_relevant_tools)[:50])
 
     prep_timings["tool_selection"] = time.time() - _t1

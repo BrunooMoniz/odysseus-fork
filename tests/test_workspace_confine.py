@@ -204,23 +204,25 @@ def _sent_tool_names(monkeypatch, *, workspace):
     return {t["function"]["name"] for t in schemas if isinstance(t, dict) and "function" in t}
 
 
-def test_low_signal_with_workspace_surfaces_readonly_file_tools(monkeypatch):
+def test_agent_always_offers_full_core_toolkit_even_low_signal(monkeypatch):
+    # Cure for the tool gating (tool_security.augment_with_core_tools): in agent
+    # mode the FULL core terminal toolkit is ALWAYS offered, so even a vague
+    # ("low-signal") prompt reaches a real agent instead of collapsing to
+    # ask_user/manage_memory. Execution stays confined to the workspace / data
+    # dir regardless — that boundary is tested separately below.
     names = _sent_tool_names(monkeypatch, workspace="/tmp")
-    # read-only nav tools surface so the agent can explore
-    assert "read_file" in names
-    assert "get_workspace" in names
-    assert "grep" in names
-    # write/shell tools do NOT surface on a vague message
-    assert "write_file" not in names
-    assert "edit_file" not in names
-    assert "bash" not in names
-    assert "python" not in names
+    for t in ("read_file", "write_file", "edit_file", "bash", "python",
+              "grep", "glob", "ls", "get_workspace"):
+        assert t in names, t
 
 
-def test_low_signal_without_workspace_excludes_file_tools(monkeypatch):
+def test_core_toolkit_present_even_without_a_user_workspace(monkeypatch):
+    # A missing user workspace still has the data-dir sandbox as cwd, so the core
+    # toolkit is offered (the agent is never crippled by the absence of a
+    # selected workspace; the path confinement layer still bounds execution).
     names = _sent_tool_names(monkeypatch, workspace=None)
-    assert "read_file" not in names
-    assert "get_workspace" not in names
+    for t in ("read_file", "bash", "edit_file", "get_workspace"):
+        assert t in names, t
 
 
 # ── browse route is admin-gated ─────────────────────────────────────────
